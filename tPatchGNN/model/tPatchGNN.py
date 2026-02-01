@@ -8,8 +8,7 @@ from model.SelfAttention_Family import FullAttention, AttentionLayer
 
 import lib.utils as utils
 from lib.evaluation import *
-
-# # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # 
+from model.patchTransformer import PatchTransformer 
 
 class nconv(nn.Module):
 	def __init__(self):
@@ -21,6 +20,7 @@ class nconv(nn.Module):
 		x = torch.einsum('bfnm,bmnv->bfvm',(x,A)) # used
 		# print(x.shape)
 		return x.contiguous() # (B, F, N, M)
+		
 
 class linear(nn.Module):
 	def __init__(self, c_in, c_out):
@@ -113,6 +113,23 @@ class tPatchGNN(nn.Module):
 		d_model = args.hid_dim
 		## Transformer
 		self.ADD_PE = PositionalEncoding(d_model) 
+
+		#===========================================  refill the explicit masked patch modeling module 
+		# self.mask_ratio = getattr(args, "mask_ratio", 0.15)         
+		# self.mp_lambda  = getattr(args, "mp_lambda", 1.0)           
+		# self.explicit_mp = nn.ModuleList()
+		# for _ in range(self.n_layer):
+		# 	self.explicit_mp.append(
+		# 		PatchTransformer(
+		# 			d_model=args.hid_dim,
+		# 			nhead=args.nhead,
+		# 			num_layers=args.tf_layer,
+		# 			pred_dim=args.hid_dim - 1,       
+		# 			mask_ratio=self.mask_ratio
+		# 		)
+		# 	)
+		#===========================================
+
 		self.transformer_encoder = nn.ModuleList()
 		for _ in range(self.n_layer):
 			encoder_layer = nn.TransformerEncoderLayer(d_model=d_model, nhead=args.nhead, batch_first=True)
@@ -163,8 +180,19 @@ class tPatchGNN(nn.Module):
 		elif(self.outlayer == "CNN"):
 			self.temporal_agg = nn.Sequential(
 				nn.Conv1d(d_model, enc_dim, kernel_size=self.M))
+		#===========================================  subsitute query-based attention for dncoder
+		# self.num_queries = 4
+		# self.query_embed = nn.Embedding(self.num_queries, enc_dim)  
 
-		### Decoder ###
+		# self.query_attn = nn.MultiheadAttention(
+		# 	embed_dim=enc_dim,
+		# 	num_heads=args.nhead,
+		# 	batch_first=True
+		# )
+
+		# self.query_classifier = nn.Linear(enc_dim, 2)
+		#===========================================
+
 		self.decoder = nn.Sequential(
 			nn.Linear(enc_dim+args.te_dim, args.hid_dim),
 			nn.ReLU(inplace=True),
@@ -172,7 +200,19 @@ class tPatchGNN(nn.Module):
 			nn.ReLU(inplace=True),
 			nn.Linear(args.hid_dim, 1)
 			)
-		
+		self.patch_gattn = nn.ModuleList([
+		PatchGraphAttention(d_model=args.hid_dim, nhead=args.nhead, tau=getattr(args, "tau", 60.0), delta_minutes=5.0)
+		for _ in range(self.n_layer)
+		])
+				
+
+		# self-attention over patches (you already have transformer_encoder[layer])
+		# keep self.transformer_encoder as patch-level SA
+
+		# 5-query classifier
+		self.classifier = QueryClassifier5(d_model=args.hid_dim, nhead=args.nhead, num_classes=5)
+
+
 	def LearnableTE(self, tt):
 		# tt: (N*M*B, L, 1)
 		out1 = self.te_scale(tt)
@@ -195,100 +235,166 @@ class tPatchGNN(nn.Module):
 		return h_t
 
 	def IMTS_Model(self, x, mask_X):
-		"""
-		x (B*N*M, L, F)
-		mask_X (B*N*M, L, 1)
-		"""
-		# mask for the patch
-		mask_patch = (mask_X.sum(dim=1) > 0) # (B*N*M, 1)
+		# x (B*N*M, L, F), mask_X (B*N*M, L, 1)
+		mask_patch = (mask_X.sum(dim=1) > 0)          # (B*N*M, 1) bool
 
-		### TTCN for patch modeling ###
-		x_patch = self.TTCN(x, mask_X) # (B*N*M, hid_dim-1)
-		x_patch = torch.cat([x_patch, mask_patch],dim=-1) # (B*N*M, hid_dim)
-		x_patch = x_patch.view(self.batch_size, self.N, self.M, -1) # (B, N, M, hid_dim)
+		# ---- patch internal aggregation (keep TTCN) ----
+		x_patch = self.TTCN(x, mask_X)                # (B*N*M, hid_dim-1)
+		x_patch = torch.cat([x_patch, mask_patch], dim=-1)  # (B*N*M, hid_dim)
+
+		x_patch = x_patch.view(self.batch_size, self.N, self.M, -1)  # (B, N, M, D)
 		B, N, M, D = x_patch.shape
+		patch_mask = mask_patch.view(B, N, M)         # (B, N, M) bool
 
 		x = x_patch
+
 		for layer in range(self.n_layer):
+			if layer > 0:
+				x_last = x
 
-			if(layer > 0): # residual
-				x_last = x.clone()
-				
-			### Transformer for temporal modeling ###
-			x = x.reshape(B*N, M, -1) # (B*N, M, F)
-			x = self.ADD_PE(x)
-			x = self.transformer_encoder[layer](x).view(x_patch.shape) # (B, N, M, F)
+			# ---- (1) patch graph attention (time-diff weighted) ----
+			# apply per node N: reshape to (B*N, M, D)
+			x_bn = x.reshape(B * N, M, D)
+			pm_bn = patch_mask.reshape(B * N, M).float()
+			x_bn = x_bn + self.patch_gattn[layer](x_bn, pm_bn)        # residual-style
+			x = x_bn.view(B, N, M, D)
 
-			### GNN for inter-time series modeling ###
-			### time-adaptive graph structure learning ###
-			nodevec1 = self.nodevec1.view(1, 1, N, self.nodevec_dim).repeat(B, M, 1, 1)
-			nodevec2 = self.nodevec2.view(1, 1, self.nodevec_dim, N).repeat(B, M, 1, 1)
-			x_gate1 = self.nodevec_gate1[layer](torch.cat([x, nodevec1.permute(0, 2, 1, 3)], dim=-1))
-			x_gate2 = self.nodevec_gate2[layer](torch.cat([x, nodevec2.permute(0, 3, 1, 2)], dim=-1))
-			x_p1 = x_gate1 * self.nodevec_linear1[layer](x) # (B, M, N, 10)
-			x_p2 = x_gate2 * self.nodevec_linear2[layer](x) # (B, M, N, 10)
-			nodevec1 = nodevec1 + x_p1.permute(0,2,1,3) # (B, M, N, 10)
-			nodevec2 = nodevec2 + x_p2.permute(0,2,3,1) # (B, M, 10, N)
+			# ---- (2) patch self-attention (Transformer) ----
+			x_bn = x.reshape(B * N, M, D)
+			x_bn = self.ADD_PE(x_bn)
+			x_bn = self.transformer_encoder[layer](x_bn)             # (B*N, M, D)
+			x = x_bn.view(B, N, M, D)
 
-			adp = F.softmax(F.relu(torch.matmul(nodevec1, nodevec2)), dim=-1) # (B, M, N, N) used
-			new_supports = self.supports + [adp]
+			# ---- (3) keep / remove your inter-series GNN part? ----
+			# 你这次描述里没有要 node-to-node 的 inter-series gconv，
+			# 如果你要“只做 patch 之间”，这里就应该删掉下面整段 gconv 图学习。
+			# 如果仍想保留 inter-series（每个 patch 的 N 节点之间），就保留原来的 gconv。
+			# 我先按你描述：删除 gconv（否则是另一个图）。
 
-			# input x shape (B, F, N, M)
-			x = self.gconv[layer](x.permute(0,3,1,2), new_supports) # (B, F, N, M)
-			x = x.permute(0, 2, 3, 1) # (B, N, M, F)
+			if layer > 0:
+				x = x_last + x
 
-			if(layer > 0): # residual addition
-				x = x_last + x 
+		# ---- classification head ----
+		# 你要 “整体 patch” 做分类：对每个 node N 做？还是对整条序列（把N汇聚）做？
+		# 通常 anomaly 是对一个对象整体：建议先在 N 维做 pooling，再用 query 分类。
+		x_seq = x.mean(dim=1)                         # (B, M, D)  在 N 上平均池化
+		pm_seq = patch_mask.any(dim=1).float()        # (B, M)     N里任一有效就算有效 patch
 
-		### Output layer ###
-		if(self.outlayer == "CNN"):
-			x = x.reshape(self.batch_size*self.N, self.M, -1).permute(0, 2, 1) # (B*N, F, M)
-			x = self.temporal_agg(x) # (B*N, F, M) -> (B*N, F, 1)
-			x = x.view(self.batch_size, self.N, -1) # (B, N, F)
+		logits = self.classifier(x_seq, pm_seq)       # (B, 5)
+		return logits
 
-		elif(self.outlayer == "Linear"):
-			x = x.reshape(self.batch_size, self.N, -1) # (B, N, M*F)
-			x = self.temporal_agg(x) # (B, N, hid_dim)
+	def forward(self, batch):
+		# batch:
+		# data_sequence: (B, Lmax, D)
+		# ts_sequence: (B, Lmax)
+		# delta_sequence: (B, Lmax)
+		# label: (B,)
+		# patch_mask: (B, P)
+		# patch_index: (B, P)
+		# num_batch: (B,)
 
-		return x
+		X = batch["data_sequence"]         # (B, Lmax, D)
+		ts = batch["ts_sequence"]          # (B, Lmax)
+		# 你现在的 TTCN 路径需要 (B, M, L, 1) 这种“已切 patch”的形式
+		# 所以你必须在这里先把 (B, Lmax, D) 按 patch_index/patch_mask 切成 (B, M, L, D)
+		# 然后再 reshape 成你现有 IMTS_Model 需要的 (B*N*M, L, F)
 
-	def forecasting(self, time_steps_to_predict, X, truth_time_steps, mask = None):
-		
-		""" 
-		time_steps_to_predict (B, L) [0, 1]
-		X (B, M, L, N) 
-		truth_time_steps (B, M, L, N) [0, 1]
-		mask (B, M, L, N)
+		# ---- 这里先给接口：你实现 patchify() 后接入 ----
+		X_patch, ts_patch, mask_patch_points = self.patchify(X, ts, batch["patch_index"], batch["patch_mask"])
+		# X_patch: (B, M, L, 1)  (如果是单变量)
+		# ts_patch: (B, M, L, 1)
+		# mask_patch_points: (B, M, L, 1)
 
-		To ====>
-
-        X (B*N*M, L, 1)
-		truth_time_steps (B*N*M, L, 1)
-        mask_X (B*N*M, L, 1)
-        """
-
-		B, M, L_in, N = X.shape
+		B, M, L, _ = X_patch.shape
 		self.batch_size = B
-		X = X.permute(0, 3, 1, 2).reshape(-1, L_in, 1) # (B*N*M, L, 1)
-		truth_time_steps = truth_time_steps.permute(0, 3, 1, 2).reshape(-1, L_in, 1)  # (B*N*M, L, 1)
-		mask = mask.permute(0, 3, 1, 2).reshape(-1, L_in, 1)  # (B*N*M, L, 1)
-		te_his = self.LearnableTE(truth_time_steps) # (B*N*M, L, F_te)
 
-		X = torch.cat([X, te_his], dim=-1)  # (B*N*M, L, F)
+		X_patch = X_patch.permute(0, 2, 1, 3)  # (B, L, M, 1) 只是示例，按你 N/M 约定调整
 
-		### *** a encoder to model irregular time series
-		h = self.IMTS_Model(X, mask) # (B, N, hid_dim)
+class PatchGraphAttention(nn.Module):
+    def __init__(self, d_model, nhead=4, tau=1.0, delta_minutes=5.0):
+        super().__init__()
+        assert d_model % nhead == 0
+        self.d_model = d_model
+        self.nhead = nhead
+        self.d_head = d_model // nhead
+        self.tau = tau
+        self.delta = delta_minutes * 60.0  # seconds
 
-		""" Decoder """
-		L_pred = time_steps_to_predict.shape[-1]
-		h = h.unsqueeze(dim=-2).repeat(1, 1, L_pred, 1) # (B, N, Lp, F)
-		time_steps_to_predict = time_steps_to_predict.view(B, 1, L_pred, 1).repeat(1, N, 1, 1) # (B, N, Lp, 1)
-		te_pred = self.LearnableTE(time_steps_to_predict) # (B, N, Lp, F_te)
+        self.q_proj = nn.Linear(d_model, d_model, bias=True)
+        self.k_proj = nn.Linear(d_model, d_model, bias=True)
+        self.v_proj = nn.Linear(d_model, d_model, bias=True)
+        self.out_proj = nn.Linear(d_model, d_model, bias=True)
 
-		h = torch.cat([h, te_pred], dim=-1) # (B, N, Lp, F)
+    def _time_weight_bias(self, M, device):
+        # dist(i,j) = |i-j| * delta
+        idx = torch.arange(M, device=device)
+        dist = (idx[:, None] - idx[None, :]).abs().float() * self.delta
+        w = torch.exp(-dist / self.tau)                 # (M, M), in (0,1]
+        bias = torch.log(w + 1e-12)                     # log-weight as additive bias
+        return bias                                     # (M, M)
 
-		# (B, N, Lp, F) -> (B, N, Lp, 1) -> (1, B, Lp, N)
-		outputs = self.decoder(h).squeeze(dim=-1).permute(0, 2, 1).unsqueeze(dim=0) 
+    def forward(self, H, patch_mask):
+        """
+        H: (B, M, D) patch tokens
+        patch_mask: (B, M) bool/0-1, 1 means valid patch
+        """
+        B, M, D = H.shape
+        device = H.device
 
-		return outputs # (1, B, Lp, N)
+        q = self.q_proj(H).view(B, M, self.nhead, self.d_head).transpose(1, 2)  # (B, h, M, dh)
+        k = self.k_proj(H).view(B, M, self.nhead, self.d_head).transpose(1, 2)  # (B, h, M, dh)
+        v = self.v_proj(H).view(B, M, self.nhead, self.d_head).transpose(1, 2)  # (B, h, M, dh)
 
+        attn = torch.matmul(q, k.transpose(-2, -1)) / math.sqrt(self.d_head)    # (B, h, M, M)
+
+        # add time-diff bias (shared across batch & heads)
+        bias = self._time_weight_bias(M, device)                                 # (M, M)
+        attn = attn + bias[None, None, :, :]
+
+        # mask invalid patches (as keys)
+        if patch_mask is not None:
+            key_mask = (patch_mask == 0)                                         # (B, M) True=invalid
+            attn = attn.masked_fill(key_mask[:, None, None, :], -1e9)
+
+        A = torch.softmax(attn, dim=-1)                                          # (B, h, M, M)
+        out = torch.matmul(A, v)                                                 # (B, h, M, dh)
+
+        out = out.transpose(1, 2).contiguous().view(B, M, D)                     # (B, M, D)
+        out = self.out_proj(out)
+
+        # optionally zero-out invalid query positions too
+        if patch_mask is not None:
+            out = out * patch_mask.unsqueeze(-1).float()
+
+        return out
+
+class QueryClassifier5(nn.Module):
+    def __init__(self, d_model, nhead=4, num_classes=5):
+        super().__init__()
+        assert num_classes == 5
+        self.num_queries = 5
+        self.query_embed = nn.Embedding(self.num_queries, d_model)
+
+        self.cross_attn = nn.MultiheadAttention(
+            embed_dim=d_model, num_heads=nhead, batch_first=True
+        )
+
+        # each query -> one class logit
+        self.query_to_logit = nn.Linear(d_model, 1)
+
+    def forward(self, patch_tokens, patch_mask=None):
+        """
+        patch_tokens: (B, M, D)
+        patch_mask: (B, M) 1=valid, 0=invalid
+        return logits: (B, 5)
+        """
+        B, M, D = patch_tokens.shape
+        q = self.query_embed.weight.unsqueeze(0).repeat(B, 1, 1)  # (B, 5, D)
+
+        key_padding_mask = None
+        if patch_mask is not None:
+            key_padding_mask = (patch_mask == 0)                 # True=pad
+
+        z, _ = self.cross_attn(q, patch_tokens, patch_tokens, key_padding_mask=key_padding_mask)
+        logits = self.query_to_logit(z).squeeze(-1)              # (B, 5)
+        return logits

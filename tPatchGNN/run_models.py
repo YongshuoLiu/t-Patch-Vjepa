@@ -17,44 +17,124 @@ import torch.optim as optim
 
 import lib.utils as utils
 from lib.parse_datasets import parse_datasets
-from model.tPatchGNN import *
+from model.tPatchCAdetr import *
 
-parser = argparse.ArgumentParser('IMTS Forecasting')
 
+def save_checkpoint(path, model, optimizer, epoch, best_val_BCE, best_iter, experimentID, args):
+    ckpt = {
+        "epoch": epoch,
+        "best_val_BCE": float(best_val_BCE),
+        "best_iter": int(best_iter),
+        "experimentID": int(experimentID),
+        "model_state": model.state_dict(),
+        "optim_state": optimizer.state_dict(),
+        "args": vars(args),  
+    }
+    torch.save(ckpt, path)
+
+
+def load_checkpoint(path, model, optimizer=None, map_location="cpu"):
+    ckpt = torch.load(path, map_location=map_location)
+    model.load_state_dict(ckpt["model_state"], strict=True)
+
+    if optimizer is not None and "optim_state" in ckpt:
+        optimizer.load_state_dict(ckpt["optim_state"])
+
+    epoch = int(ckpt.get("epoch", 0))
+    best_val_BCE = float(ckpt.get("best_val_BCE", np.inf))
+    best_iter = int(ckpt.get("best_iter", -1))
+    experimentID = int(ckpt.get("experimentID", -1))
+    return ckpt, epoch, best_val_BCE, best_iter, experimentID
+
+
+parser = argparse.ArgumentParser('IMTS Patch-Level Classification')
+
+# --------------------
+# Run / misc
+# --------------------
 parser.add_argument('--state', type=str, default='def')
-parser.add_argument('-n',  type=int, default=int(1e8), help="Size of the dataset")
-parser.add_argument('--hop', type=int, default=1, help="hops in GNN")
-parser.add_argument('--nhead', type=int, default=1, help="heads in Transformer")
-parser.add_argument('--tf_layer', type=int, default=1, help="# of layer in Transformer")
-parser.add_argument('--nlayer', type=int, default=1, help="# of layer in TSmodel")
-parser.add_argument('--epoch', type=int, default=1000, help="training epoches")
-parser.add_argument('--patience', type=int, default=10, help="patience for early stop")
-parser.add_argument('--history', type=int, default=24, help="number of hours (months for ushcn and ms for activity) as historical window")
-parser.add_argument('-ps', '--patch_size', type=float, default=24, help="window size for a patch")
-parser.add_argument('--stride', type=float, default=24, help="period stride for patch sliding")
-parser.add_argument('--logmode', type=str, default="a", help='File mode of logging.')
-
-parser.add_argument('--lr',  type=float, default=1e-3, help="Starting learning rate.")
-parser.add_argument('--w_decay', type=float, default=0.0, help="weight decay.")
-parser.add_argument('-b', '--batch_size', type=int, default=32)
-
 parser.add_argument('--save', type=str, default='experiments/', help="Path for save checkpoints")
 parser.add_argument('--load', type=str, default=None, help="ID of the experiment to load for evaluation. If None, run a new experiment.")
+parser.add_argument('--logmode', type=str, default="a", help='File mode of logging.')
 parser.add_argument('--seed', type=int, default=1, help="Random seed")
-parser.add_argument('--dataset', type=str, default='physionet', help="Dataset to load. Available: physionet, mimic, ushcn")
-
-# value 0 means using original time granularity, Value 1 means quantization by 1 hour, 
-# value 0.1 means quantization by 0.1 hour = 6 min, value 0.016 means quantization by 0.016 hour = 1 min
-parser.add_argument('--quantization', type=float, default=0.0, help="Quantization on the physionet dataset.")
-parser.add_argument('--model', type=str, default='tPatchGNN', help="Model name")
-parser.add_argument('--outlayer', type=str, default='Linear', help="Model name")
-parser.add_argument('-hd', '--hid_dim', type=int, default=64, help="Number of units per hidden layer")
-parser.add_argument('-td', '--te_dim', type=int, default=10, help="Number of units for time encoding")
-parser.add_argument('-nd', '--node_dim', type=int, default=10, help="Number of units for node vectors")
 parser.add_argument('--gpu', type=str, default='0', help='which gpu to use.')
 
+# --------------------
+# Data
+# --------------------
+parser.add_argument('-n', type=int, default=int(1e8), help="Size of the dataset")
+parser.add_argument('--dataset', type=str, default='mulity_source',
+                    help="Dataset to load. Available: physionet, mimic, ushcn, mulity_source")
+
+# quantization (optional dataset preprocessing)
+parser.add_argument('--quantization', type=float, default=0.0,
+                    help="Quantization on timestamps (dataset-side). 0 means no quantization.")
+
+# (optional legacy sliding-window params; DO NOT use them to compute npatch anymore)
+parser.add_argument('--history', type=int, default=24,
+                    help="Historical window for legacy patching; dataset-side only.")
+parser.add_argument('-ps', '--patch_size', type=float, default=24,
+                    help="Legacy window size for a patch; dataset-side only.")
+parser.add_argument('--stride', type=float, default=24,
+                    help="Legacy stride for patch sliding; dataset-side only.")
+
+# --------------------
+# Training
+# --------------------
+parser.add_argument('--epoch', type=int, default=200, help="training epochs")
+parser.add_argument('--patience', type=int, default=10, help="patience for early stop")
+parser.add_argument('--lr', type=float, default=1e-3, help="Starting learning rate.")
+parser.add_argument('--w_decay', type=float, default=0.0, help="weight decay.")
+parser.add_argument('-b', '--batch_size', type=int, default=2)
+parser.add_argument('--patch_minutes', type=int, default=5)
+
+parser.add_argument('--max_patches', type=int, default=15)
+
+
+# Model (NEW)
+# --------------------
+parser.add_argument('--model', type=str, default='tPatchGNN_Classifier', help="Model name")
+
+# patch padding dimensions (CRITICAL for your new pipeline)
+parser.add_argument('--npatch', type=int, default=15,
+                    help="Max number of patches per sample (padding dimension). "
+                         "batch['patch_mask'] and batch['patch_index'] must have shape (B, npatch).")
+parser.add_argument('--json_path', type=str, default="/home/UNT/yl0826/QAU/t-PatchGNN/lib/test.json",
+                    help="dataset: json file.")
+
+parser.add_argument('--patch_len', type=int, default=64,
+                    help="Max number of timesteps per patch after padding/truncation.")
+
+# input feature dim (data_sequence last dim D)
+parser.add_argument('--in_dim', type=int, default=4,
+                    help="Input feature dimension D in data_sequence: (B, Lmax, D).")
+
+# architecture
+parser.add_argument('--nhead', type=int, default=4, help="Heads in attention modules")
+parser.add_argument('--tf_layer', type=int, default=1, help="#layers inside TransformerEncoder")
+parser.add_argument('--nlayer', type=int, default=2, help="#stacks of (graph-attn + self-attn)")
+parser.add_argument('-hd', '--hid_dim', type=int, default=64, help="Hidden dimension for patch tokens")
+parser.add_argument('-td', '--te_dim', type=int, default=10, help="Time encoding dimension")
+
+# time-diff weighting for patch graph attention
+parser.add_argument('--tau_seconds', type=float, default=300.0,
+                    help="Decay scale (seconds) for time-diff bias in patch graph attention. "
+                         "Larger -> more uniform weights across patches.")
+
+# classification
+parser.add_argument('--num_classes', type=int, default=5,
+                    help="Number of anomaly classes. For your setting must be 5.")
+parser.add_argument('--label_smoothing', type=float, default=0.0,
+                    help="Optional label smoothing for CE loss (0.0 means none).")
+
+
+parser.add_argument('--max_total_steps', type=int, default=15,
+                    help="Number of max_total_steps. after padding the number time step must be 15.")
+
+
 args = parser.parse_args()
-args.npatch = int(np.ceil((args.history - args.patch_size) / args.stride)) + 1 # (window size for a patch)
+
+
 
 os.environ["CUDA_VISIBLE_DEVICES"] = args.gpu
 file_name = os.path.basename(__file__)[:-3]
@@ -64,97 +144,126 @@ print("PID, device:", args.PID, args.device)
 
 #####################################################################################################
 
+
 if __name__ == '__main__':
-	utils.setup_seed(args.seed)
 
-	experimentID = args.load
-	if experimentID is None:
-		# Make a new experiment ID
-		experimentID = int(SystemRandom().random()*100000)
-	ckpt_path = os.path.join(args.save, "experiment_" + str(experimentID) + '.ckpt')
-	
-	input_command = sys.argv
-	ind = [i for i in range(len(input_command)) if input_command[i] == "--load"]
-	if len(ind) == 1:
-		ind = ind[0]
-		input_command = input_command[:ind] + input_command[(ind+2):]
-	input_command = " ".join(input_command)
+    utils.setup_seed(args.seed)
 
-	# utils.makedirs("results/")
+    experimentID = args.load
+    if experimentID is None:
+        experimentID = int(SystemRandom().random() * 100000)
 
-	##################################################################
-	data_obj = parse_datasets(args, patch_ts=True)
-	input_dim = data_obj["input_dim"]
-	
-	### Model setting ###
-	args.ndim = input_dim
-	model = tPatchGNN(args).to(args.device)
+    ckpt_path = os.path.join(args.save, "experiment_" + str(experimentID) + ".ckpt")
 
-	##################################################################
-	
-	# # Load checkpoint and evaluate the model
-	# if args.load is not None:
-	# 	utils.get_ckpt_model(ckpt_path, model, args.device)
-	# 	exit()
+    input_command = sys.argv
+    ind = [i for i in range(len(input_command)) if input_command[i] == "--load"]
+    if len(ind) == 1:
+        ind = ind[0]
+        input_command = input_command[:ind] + input_command[(ind + 2):]
+    input_command = " ".join(input_command)
 
-	##################################################################
+    # -------- data --------
+    data_obj = parse_datasets(args, patch_ts=True)
 
-	if(args.n < 12000):
-		args.state = "debug"
-		log_path = "logs/{}_{}_{}.log".format(args.dataset, args.model, args.state)
-	else:
-		log_path = "logs/{}_{}_{}_{}patch_{}stride_{}layer_{}lr.log". \
-			format(args.dataset, args.model, args.state, args.patch_size, args.stride, args.nlayer, args.lr)
-	
-	if not os.path.exists("logs/"):
-		utils.makedirs("logs/")
-	logger = utils.get_logger(logpath=log_path, filepath=os.path.abspath(__file__), mode=args.logmode)
-	logger.info(datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S"))
-	logger.info(input_command)
-	logger.info(args)
+    # -------- model --------
+    model = tPatchGNN_Classifier(args).to(args.device)
+    optimizer = optim.Adam(model.parameters(), lr=args.lr)
 
-	optimizer = optim.Adam(model.parameters(), lr=args.lr)
+    # -------- logger --------
+    if args.n < 12000:
+        args.state = "debug"
+        log_path = "logs/{}_{}_{}.log".format(args.dataset, args.model, args.state)
+    else:
+        log_path = "logs/{}_{}_{}_{}patch_{}stride_{}layer_{}lr.log".format(
+            args.dataset, args.model, args.state, args.patch_size, args.stride, args.nlayer, args.lr
+        )
 
-	num_batches = data_obj["n_train_batches"] # n_sample / batch_size
-	print("n_train_batches:", num_batches)
+    if not os.path.exists("logs/"):
+        utils.makedirs("logs/")
 
-	best_val_mse = np.inf
-	test_res = None
-	for itr in range(args.epoch):
-		st = time.time()
+    logger = utils.get_logger(logpath=log_path, filepath=os.path.abspath(__file__), mode=args.logmode)
+    logger.info(datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S"))
+    logger.info(input_command)
+    logger.info(args)
 
-		### Training ###
-		model.train()
-		for _ in range(num_batches):
-			optimizer.zero_grad()
-			batch_dict = utils.get_next_batch(data_obj["train_dataloader"])
-			train_res = compute_all_losses(model, batch_dict)
-			train_res["loss"].backward()
-			optimizer.step()
+    # -------- resume (if args.load given and file exists) --------
+    best_val_BCE = np.inf
+    best_iter = -1
+    start_epoch = 0
+    test_res = None
 
-		### Validation ###
-		model.eval()
-		with torch.no_grad():
-			val_res = evaluation(model, data_obj["val_dataloader"], data_obj["n_val_batches"])
-			
-			### Testing ###
-			if(val_res["mse"] < best_val_mse):
-				best_val_mse = val_res["mse"]
-				best_iter = itr
-				test_res = evaluation(model, data_obj["test_dataloader"], data_obj["n_test_batches"])
-			
-			logger.info('- Epoch {:03d}, ExpID {}'.format(itr, experimentID))
-			logger.info("Train - Loss (one batch): {:.5f}".format(train_res["loss"].item()))
-			logger.info("Val - Loss, MSE, RMSE, MAE, MAPE: {:.5f}, {:.5f}, {:.5f}, {:.5f}, {:.2f}%" \
-				.format(val_res["loss"], val_res["mse"], val_res["rmse"], val_res["mae"], val_res["mape"]*100))
-			if(test_res != None):
-				logger.info("Test - Best epoch, Loss, MSE, RMSE, MAE, MAPE: {}, {:.5f}, {:.5f}, {:.5f}, {:.5f}, {:.2f}%" \
-					.format(best_iter, test_res["loss"], test_res["mse"],\
-			 		 test_res["rmse"], test_res["mae"], test_res["mape"]*100))
-			logger.info("Time spent: {:.2f}s".format(time.time()-st))
+    if args.load is not None and os.path.exists(ckpt_path):
+        _, start_epoch, best_val_BCE, best_iter, _ = load_checkpoint(
+            ckpt_path, model, optimizer=optimizer, map_location=args.device
+        )
+        logger.info("Loaded checkpoint: {} (start_epoch={}, best_val_BCE={:.6f}, best_iter={})".format(
+            ckpt_path, start_epoch, best_val_BCE, best_iter
+        ))
+    else:
+        logger.info("No checkpoint loaded. Training from scratch. Will save to: {}".format(ckpt_path))
 
-		if(itr - best_iter >= args.patience):
-			print("Exp has been early stopped!")
-			sys.exit(0)
+    # -------- train loop --------
+    num_batches = data_obj["n_train_batches"]
+    print("n_train_batches:", num_batches)
+
+    for itr in range(start_epoch, args.epoch):
+        st = time.time()
+
+        # --- Training ---
+        model.train()
+        last_train_loss = None
+        for _ in range(num_batches):
+            optimizer.zero_grad()
+            batch_dict = utils.get_next_batch(data_obj["train_dataloader"])
+
+            train_res = compute_classfaction_losses(model, batch_dict)
+
+            loss = train_res["loss"]
+            loss.backward()
+            optimizer.step()
+
+            last_train_loss = loss
+
+        # --- Validation ---
+        model.eval()
+        with torch.no_grad():
+            val_res = evaluation(model, data_obj["val_dataloader"], data_obj["n_val_batches"])
+
+            # --- Save best + test ---
+            if val_res["BCE"] < best_val_BCE:
+                best_val_BCE = val_res["BCE"]
+                best_iter = itr
 
 
+                test_res = evaluation(model, data_obj["test_dataloader"], data_obj["n_test_batches"])
+
+
+                if not os.path.exists(args.save):
+                    utils.makedirs(args.save)
+                save_checkpoint(
+                    ckpt_path, model, optimizer,
+                    epoch=itr,
+                    best_val_BCE=best_val_BCE,
+                    best_iter=best_iter,
+                    experimentID=experimentID,
+                    args=args
+                )
+                logger.info("Saved checkpoint to {} (best_val_BCE={:.6f})".format(ckpt_path, best_val_BCE))
+
+            # --- logging ---
+            logger.info('- Epoch {:03d}, ExpID {}'.format(itr, experimentID))
+
+            if last_train_loss is not None:
+                logger.info("Train - Loss (last batch): {:.5f}".format(last_train_loss.item()))
+
+            logger.info("Val - Loss, BCE: {:.6f}".format(val_res["BCE"]))
+
+            if test_res is not None:
+                logger.info("Test - Best epoch, Loss, BCE: {}, {:.6f}".format(best_iter, test_res["BCE"]))
+
+            logger.info("Time spent: {:.2f}s".format(time.time() - st))
+
+        # --- early stop ---
+        if best_iter >= 0 and (itr - best_iter) >= args.patience:
+            logger.info("Early stopped! best_iter={}, best_val_BCE={:.6f}".format(best_iter, best_val_BCE))
+            sys.exit(0)

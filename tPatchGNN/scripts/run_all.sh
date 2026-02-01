@@ -1,7 +1,8 @@
 ### tPatchGNN ###
 patience=10
 gpu=0
-
+export PYTHONNOUSERSITE=1
+export PYTHONPATH=""  
 for seed in {1..5}
 do
     python run_models.py \
@@ -11,7 +12,7 @@ do
     --te_dim 10 --node_dim 10 --hid_dim 64 \
     --outlayer Linear --seed $seed --gpu $gpu
 
-
+bash scripts/run_all.sh
     python run_models.py \
     --dataset mimic --state 'def' --history 24 \
     --patience $patience --batch_size 32 --lr 1e-3 \

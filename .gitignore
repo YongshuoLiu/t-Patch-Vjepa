@@ -1,0 +1,24 @@
+# python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+# logs / runs / outputs
+logs/
+runs/
+tPatchGNN/logs/
+tPatchGNN/experiments/
+
+# data / checkpoints / archives
+data/
+*.pt
+*.pth
+*.ckpt
+*.zip
+*.tar
+*.tar.gz
+
+# misc
+.DS_Store
+a.txt
